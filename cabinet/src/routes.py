@@ -30,7 +30,7 @@ def _realmify_dashboard_url(url: str) -> str:
 
 
 FINAL_DASHBOARD_URL = _realmify_dashboard_url(
-    os.getenv("dashboard_url", "https://app.signalfx.com/#/dashboard/"),
+    os.getenv("dashboard_url", "https://app.signalfx.com/#/dashboards/"),
 )
 
 
