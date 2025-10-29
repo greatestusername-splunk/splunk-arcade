@@ -7,6 +7,7 @@ import requests
 from flask import Blueprint, jsonify, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 from opentelemetry import trace
+import time
 
 from src.db import db
 from src.login import login
@@ -237,40 +238,50 @@ def get_walkthrough(module: str, stage: str):
     return content.json()
 
 
-@routes.route("/progression", methods=["GET"])
-def get_progression():
+# Cache for progression
+_progression_cache = {}
+_cache_expiry = {}
+
+def _get_player_progression():
+    # GET progression with  30s cache and 5s timeout
+    
+    cache_key = PLAYER_NAME
+    current_time = time.time()
+
+    if (cache_key in _progression_cache and 
+        cache_key in _cache_expiry and 
+        current_time < _cache_expiry[cache_key]):
+        return _progression_cache[cache_key]
+    
     ret = requests.get(
         f"http://{SCOREBOARD_HOST}/player_progression",
-        headers={
-            "Player-Name": PLAYER_NAME,
-        },
+        headers={"Player-Name": PLAYER_NAME},
+        timeout=5
     )
+    
+    data = ret.json()
+    
+    _progression_cache[cache_key] = data
+    _cache_expiry[cache_key] = current_time + 30
+    
+    return data
 
-    return ret.json()
+
+@routes.route("/progression", methods=["GET"])
+def get_progression():
+    return _get_player_progression()
 
 
 @routes.route("/imvaders_version", methods=["GET"])
 def get_imvaders_version():
-    ret = requests.get(
-        f"http://{SCOREBOARD_HOST}/player_progression",
-        headers={
-            "Player-Name": PLAYER_NAME,
-        },
-    )
-
-    return {"version": ret.json()["game_versions"].get("imvaders") or 0.75}
+    data = _get_player_progression()
+    return {"version": data["game_versions"].get("imvaders") or 0.75}
 
 
 @routes.route("/get_logger_version", methods=["GET"])
 def get_logger_version():
-    ret = requests.get(
-        f"http://{SCOREBOARD_HOST}/player_progression",
-        headers={
-            "Player-Name": PLAYER_NAME,
-        },
-    )
-
-    return {"version": ret.json()["game_versions"].get("logger") or 1.0}
+    data = _get_player_progression()
+    return {"version": data["game_versions"].get("logger") or 1.0}
 
 
 @routes.route("/get_logger_ad/<string:version>/<int:life>", methods=["GET"])

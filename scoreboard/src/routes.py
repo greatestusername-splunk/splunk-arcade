@@ -12,7 +12,6 @@ routes = Blueprint("routes", __name__)
 
 GAME_VERSIONS = {
     "imvaders": [
-        # tuple is question count (total) -> verison unlocked
         (0, "0.5"),
         (3, "0.75"),
         (6, "1.0"),
@@ -53,8 +52,6 @@ def get_quiz_scores():
         score_entry = redis.hgetall(key)
 
         if score_entry.get("source", "") != "static":
-            # for now at least we only "score" (like on the scoreboard) static content
-            # -- no ai/dynamic questions count toward score for competition!
             continue
 
         scoreboard.append(score_entry)
@@ -124,6 +121,10 @@ def record_quiz_score():
         + f"{get_question_hash(question=quiz_update["question"])}",
         quiz_update,
     )
+    
+    # Bust progression cache when we quiz
+    cache_key = f"progression_cache:{quiz_update['player_name']}"
+    redis.delete(cache_key)
 
     return {}
 
@@ -146,11 +147,17 @@ def get_player_seen_questions(module: str):
 
 @routes.route("/player_progression", methods=["GET"])
 def get_player_progression():
+    # GET progression with  60s cache
     player_name = request.headers.get("Player-Name")
     if not player_name:
         raise Exception("No Player Name provided")
 
     redis = get_redis_conn()
+    
+    cache_key = f"progression_cache:{player_name}"
+    cached_result = redis.get(cache_key)
+    if cached_result:
+        return cached_result
 
     progression = {
         "level_state": {
@@ -174,9 +181,9 @@ def get_player_progression():
     ]
 
     for index, module in enumerate(modules[:-1]):
-        question_keys = redis.scan_iter(match=f"quiz:{player_name}:{module}:*")
-
-        question_count = sum(1 for _ in question_keys)
+        # Use Redis KEYS command - much faster than scan_iter for small datasets
+        question_keys = redis.keys(f"quiz:{player_name}:{module}:*")
+        question_count = len(question_keys)
 
         for idx, (required_question_count, version_to_set) in enumerate(GAME_VERSIONS[module]):
             if question_count >= required_question_count:
@@ -191,7 +198,12 @@ def get_player_progression():
         progression["level_state"]["floppybird"] = "unlocked"
         progression["level_state"]["zelda"] = "unlocked"
 
-    return jsonify(progression)
+    response = jsonify(progression)
+    
+    # Cache 60s
+    redis.setex(cache_key, 60, response.get_data(as_text=True))
+    
+    return response
 
 
 @routes.route("/reset_player_quiz_scores", methods=["POST"])
