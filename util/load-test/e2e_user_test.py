@@ -21,6 +21,7 @@ import random
 import string
 import re
 import json
+import ssl
 from dataclasses import dataclass
 from typing import List, Optional, Dict
 from collections import defaultdict
@@ -63,8 +64,9 @@ class Player:
 class End2EndUserTester:
     """Complete user journey load tester with real navigation and progression"""
     
-    def __init__(self, portal_url: str = "http://splunk-arcade.home:80"):
+    def __init__(self, portal_url: str = "http://us.splunkarcade.com:80", production: bool = False):
         self.portal_url = portal_url.rstrip('/')
+        self.production = production
         self.players: List[Player] = []
         self.created_users: List[str] = []
         
@@ -78,7 +80,7 @@ class End2EndUserTester:
     
     def generate_valid_username(self, player_id: int) -> str:
         """Generate Kubernetes-compliant username"""
-        base = f"realistic-user-{player_id:03d}"
+        base = f"loadtest-user-{player_id:03d}"
         suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=3))
         return f"{base}-{suffix}"
     
@@ -154,7 +156,7 @@ class End2EndUserTester:
                                    timeout: int = 120) -> bool:
         """Wait for player's cabinet pod to be ready"""
         start_time = time.time()
-        expected_cabinet_url = f"http://splunk-arcade.home:80/player/{player.username}"
+        expected_cabinet_url = f"{self.portal_url}/player/{player.username}"
         
         while time.time() - start_time < timeout:
             try:
@@ -312,62 +314,82 @@ class End2EndUserTester:
             player.errors += 1
             player.error_details.append(f"score_error: {str(e)[:30]}")
     
+    async def answer_single_quiz_question(self, session: aiohttp.ClientSession, player: Player, 
+                                        game_name: str, question_num: int) -> bool:
+        """Answer a single quiz question (for parallel processing)"""
+        try:
+            # Step 1: Get quiz question
+            async with session.get(f"{player.cabinet_url}/questions?module={game_name}&question_count=1") as response:
+                player.requests_made += 1
+                if response.status != 200:
+                    player.errors += 1
+                    player.error_details.append(f"quiz_load_{game_name}: {response.status}")
+                    return False
+                
+                player.pages_loaded += 1
+                html_content = await response.text()
+                
+                # Extract CSRF token for quiz submission
+                csrf_token = self.extract_csrf_token(html_content)
+                
+            # Step 2: Submit quiz answer (simulate correct answer)
+            quiz_data = {
+                "player_name": player.username,
+                "title": game_name,
+                "question": f"Sample {game_name} question {question_num}",
+                "attempts": 1,
+                "time_taken": random.uniform(5, 30),
+                "source": "static"
+            }
+            if csrf_token:
+                quiz_data['csrf_token'] = csrf_token
+            
+            async with session.post(f"{player.cabinet_url}/answer", 
+                                  json=quiz_data) as response:
+                player.requests_made += 1
+                if response.status == 200:
+                    player.quiz_questions_answered[game_name] += 1
+                    print(f"✅ {player.username}: Answered question {question_num} for {game_name}")
+                    return True
+                else:
+                    player.errors += 1
+                    player.error_details.append(f"quiz_answer_{game_name}: {response.status}")
+                    return False
+            
+        except Exception as e:
+            player.errors += 1
+            player.error_details.append(f"quiz_error: {str(e)[:30]}")
+            return False
+
     async def answer_quiz_questions(self, session: aiohttp.ClientSession, player: Player, 
                                   game_name: str) -> bool:
         """Answer quiz questions to unlock next game"""
         if game_name not in self.quiz_requirements:
-            return True  # No quiz required
+            return True
             
         questions_needed = self.quiz_requirements[game_name]
-        questions_answered = 0
         
         print(f"📝 {player.username}: Answering {questions_needed} quiz questions for {game_name}")
         
-        for _ in range(questions_needed):
-            try:
-                # Step 1: Get quiz questions
-                async with session.get(f"{player.cabinet_url}/questions?module={game_name}&question_count=1") as response:
-                    player.requests_made += 1
-                    if response.status != 200:
-                        player.errors += 1
-                        player.error_details.append(f"quiz_load_{game_name}: {response.status}")
-                        continue
-                    
-                    player.pages_loaded += 1
-                    html_content = await response.text()
-                    
-                    # Extract CSRF token for quiz submission
-                    csrf_token = self.extract_csrf_token(html_content)
-                    
-                # Step 2: Submit quiz answer (simulate correct answer)
-                quiz_data = {
-                    "player_name": player.username,
-                    "title": game_name,
-                    "question": f"Sample {game_name} question {questions_answered + 1}",
-                    "attempts": 1,
-                    "time_taken": random.uniform(5, 30),
-                    "source": "static"
-                }
-                if csrf_token:
-                    quiz_data['csrf_token'] = csrf_token
-                
-                async with session.post(f"{player.cabinet_url}/answer", 
-                                      json=quiz_data) as response:
-                    player.requests_made += 1
-                    if response.status == 200:
-                        questions_answered += 1
-                        player.quiz_questions_answered[game_name] += 1
-                        print(f"✅ {player.username}: Answered question {questions_answered}/{questions_needed} for {game_name}")
-                    else:
-                        player.errors += 1
-                        player.error_details.append(f"quiz_answer_{game_name}: {response.status}")
-                
-                # Simulate time between questions
-                await asyncio.sleep(random.uniform(3, 8))
-                
-            except Exception as e:
-                player.errors += 1
-                player.error_details.append(f"quiz_error: {str(e)[:30]}")
+        concurrent_questions = min(3, questions_needed)
+        questions_answered = 0
+        
+        for batch_start in range(0, questions_needed, concurrent_questions):
+            batch_size = min(concurrent_questions, questions_needed - batch_start)
+            
+            question_tasks = []
+            for i in range(batch_size):
+                question_num = batch_start + i + 1
+                task = asyncio.create_task(
+                    self.answer_single_quiz_question(session, player, game_name, question_num)
+                )
+                question_tasks.append(task)
+            
+            batch_results = await asyncio.gather(*question_tasks, return_exceptions=True)
+            questions_answered += sum(1 for result in batch_results if result is True)
+            
+            if batch_start + batch_size < questions_needed:
+                await asyncio.sleep(random.uniform(1, 3))
         
         if questions_answered >= questions_needed:
             player.quizzes_completed += 1
@@ -377,28 +399,31 @@ class End2EndUserTester:
             print(f"❌ {player.username}: Only answered {questions_answered}/{questions_needed} questions for {game_name}")
             return False
     
-    async def simulate_complete_user_journey(self, session: aiohttp.ClientSession, 
-                                           player: Player, duration: int):
-        """Simulate complete user journey through game progression"""
+    async def simulate_staggered_user_journey(self, session: aiohttp.ClientSession, 
+                                            player: Player, duration: int, start_delay: float):
+        """Simulate user journey with staggered start"""
         
         if not player.cabinet_url:
             print(f"❌ {player.username}: No cabinet URL available")
             return
         
+        if start_delay > 0:
+            print(f"⏰ {player.username}: Waiting {start_delay:.1f}s before starting journey")
+            await asyncio.sleep(start_delay)
+        
         print(f"🚀 {player.username}: Starting complete user journey for {duration}s")
         start_time = time.time()
         
-        # Step 1: Load home page and check initial progression
         if not await self.load_home_page(session, player):
             return
         
-        # Step 2: Play through game progression sequence
+        concurrent_tasks = []
+        
         while time.time() - start_time < duration:
             try:
-                # Update current progression state
-                await self.update_player_progression(session, player)
+                progression_task = asyncio.create_task(self.update_player_progression(session, player))
+                await progression_task
                 
-                # Find next game to play
                 available_games = [game for game in player.unlocked_games 
                                  if game in self.game_sequence]
                 
@@ -406,38 +431,39 @@ class End2EndUserTester:
                     print(f"🎉 {player.username}: No more games to unlock!")
                     break
                 
-                # Select game to play (prefer unplayed games)
                 unplayed_games = [game for game in available_games 
                                 if game not in player.games_completed]
                 
                 if unplayed_games:
                     current_game = random.choice(unplayed_games)
                 else:
-                    current_game = random.choice(available_games)  # Replay
+                    current_game = random.choice(available_games)
                 
                 print(f"🎯 {player.username}: Selected {current_game}")
                 
-                # Step 3: Play the selected game
-                if await self.select_and_play_game(session, player, current_game):
-                    
-                    # Step 4: Answer quiz questions if required
+                game_task = asyncio.create_task(self.select_and_play_game(session, player, current_game))
+                
+                if await game_task:
                     if current_game in self.quiz_requirements:
-                        quiz_success = await self.answer_quiz_questions(session, player, current_game)
+                        quiz_task = asyncio.create_task(
+                            self.answer_quiz_questions(session, player, current_game)
+                        )
+                        
+                        quiz_success = await quiz_task
                         
                         if quiz_success:
-                            # Update progression after successful quiz
                             await self.update_player_progression(session, player)
-                            
-                            # Check if new games unlocked
-                            await self.load_home_page(session, player)
                 
-                # Step 5: Navigation pause (like real user)
-                await asyncio.sleep(random.uniform(5, 15))
+                pause_duration = random.uniform(2, 8)
+                await asyncio.sleep(pause_duration)
                 
             except Exception as e:
                 player.errors += 1
                 player.error_details.append(f"journey_error: {str(e)[:30]}")
                 print(f"⚠️  {player.username}: Journey error - {e}")
+        
+        if concurrent_tasks:
+            await asyncio.gather(*concurrent_tasks, return_exceptions=True)
         
         # Final summary
         error_rate = (player.errors / player.requests_made * 100) if player.requests_made > 0 else 0
@@ -450,10 +476,20 @@ class End2EndUserTester:
         
         if player.errors > 0:
             print(f"   ❌ Top errors: {', '.join(player.error_details[:3])}")
+
+    async def simulate_complete_user_journey(self, session: aiohttp.ClientSession, 
+                                           player: Player, duration: int):
+        """Legacy method - redirects to staggered version with no delay"""
+        await self.simulate_staggered_user_journey(session, player, duration, 0)
     
     async def cleanup_player_pods(self):
-        """Clean up all created player pods"""
+        """Clean up all created player pods (local environment only)"""
         if not self.created_users:
+            return
+            
+        if self.production:
+            print(f"\n🏭 Production mode: Skipping pod cleanup for {len(self.created_users)} users")
+            print("   (Production pods managed by external systems)")
             return
             
         print(f"\n🧹 Cleaning up {len(self.created_users)} player pods...")
@@ -491,22 +527,33 @@ class End2EndUserTester:
         except Exception as e:
             print(f"⚠️  Cleanup error: {e}")
     
-    async def run_e2e_test(self, num_users: int, duration: int = 180):
-        """Run complete realistic user test with full game progression"""
+    async def run_e2e_test(self, num_users: int, duration: int = 180, burst_mode: bool = False,
+                         reg_batch_size: int = 15, login_batch_size: int = 20):
+        """Run complete E2E user test with full game progression"""
         
         print(f"🚀 Starting End2End USER load test")
         print(f"👥 Users: {num_users}")
         print(f"🌐 Portal: {self.portal_url}")
+        print(f"🔒 Production mode: {self.production} (SSL validation: {'disabled' if self.production else 'enabled'})")
         print(f"⏱️  Journey duration: {duration}s per user")
+        print(f"⚡ Burst mode: {burst_mode} (staggered starts: {not burst_mode})")
+        print(f"🔄 Batch sizes - Registration: {reg_batch_size}, Login: {login_batch_size}")
         print(f"🎮 Games in sequence: {' → '.join(self.game_sequence)}")
         
         # Connection settings optimized for full page loads
+        ssl_context = None
+        if self.production:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        
         connector = aiohttp.TCPConnector(
             limit=50,
             limit_per_host=15,
             ttl_dns_cache=300,
             use_dns_cache=True,
-            enable_cleanup_closed=True
+            enable_cleanup_closed=True,
+            ssl=ssl_context
         )
         timeout = aiohttp.ClientTimeout(total=45, connect=15)
         
@@ -515,17 +562,30 @@ class End2EndUserTester:
             try:
                 # Phase 1: Registration
                 print(f"\n👤 Phase 1: Registering {num_users} users...")
-                
+                all_players = []
                 for i in range(num_users):
                     username = self.generate_valid_username(i)
                     password = f"password{i:03d}"
+                    all_players.append(Player(username=username, password=password, session_cookies={}))
+                
+                batch_size = min(reg_batch_size, num_users)
+                
+                for i in range(0, len(all_players), batch_size):
+                    batch = all_players[i:i + batch_size]
+                    print(f"   Registering batch {i//batch_size + 1}/{(len(all_players) + batch_size - 1)//batch_size}...")
                     
-                    player = Player(username=username, password=password, session_cookies={})
+                    reg_tasks = [asyncio.create_task(
+                        self.register_user(session, player.username, player.password)
+                    ) for player in batch]
                     
-                    if await self.register_user(session, username, password):
-                        self.players.append(player)
+                    reg_results = await asyncio.gather(*reg_tasks, return_exceptions=True)
                     
-                    await asyncio.sleep(1.5)  # Don't spam registration
+                    for player, success in zip(batch, reg_results):
+                        if success is True:
+                            self.players.append(player)
+                    
+                    if i + batch_size < len(all_players):
+                        await asyncio.sleep(0.5)
                 
                 if not self.players:
                     print("❌ No users registered successfully")
@@ -533,10 +593,10 @@ class End2EndUserTester:
                 
                 print(f"✅ Registered {len(self.players)} out of {num_users} users")
                 
-                # Phase 2: Login (triggers pod creation)
+                # Phase 2: Login
                 print(f"\n🔐 Phase 2: Logging in {len(self.players)} users...")
                 
-                batch_size = min(8, len(self.players))
+                batch_size = min(login_batch_size, len(self.players))
                 logged_in_players = []
                 
                 for i in range(0, len(self.players), batch_size):
@@ -550,7 +610,7 @@ class End2EndUserTester:
                     logged_in_players.extend(batch_logged_in)
                     
                     if i + batch_size < len(self.players):
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(1)
                 
                 print(f"✅ Logged in {len(logged_in_players)} out of {len(self.players)} users")
                 
@@ -581,12 +641,29 @@ class End2EndUserTester:
                 
                 print(f"✅ {len(ready_players)} cabinet pods ready")
                 
-                # Phase 4: Full user journeys
+                # Phase 4: User journeys
                 print(f"\n🎮 Phase 4: Running complete user journeys...")
                 
-                journey_tasks = [asyncio.create_task(
-                    self.simulate_complete_user_journey(session, player, duration)
-                ) for player in ready_players]
+                journey_tasks = []
+                
+                if burst_mode:
+                    print(f"   ⚡ Burst mode: All {len(ready_players)} users starting immediately")
+                    for player in ready_players:
+                        task = asyncio.create_task(
+                            self.simulate_staggered_user_journey(session, player, duration, 0)
+                        )
+                        journey_tasks.append(task)
+                else:
+                    stagger_window = min(60, duration // 3)
+                    print(f"   📈 Staggering user starts over {stagger_window:.1f}s")
+                    
+                    for i, player in enumerate(ready_players):
+                        start_delay = random.uniform(0, stagger_window) if len(ready_players) > 1 else 0
+                        
+                        task = asyncio.create_task(
+                            self.simulate_staggered_user_journey(session, player, duration, start_delay)
+                        )
+                        journey_tasks.append(task)
                 
                 await asyncio.gather(*journey_tasks, return_exceptions=True)
                 
@@ -644,17 +721,40 @@ class End2EndUserTester:
 
 async def main():
     parser = argparse.ArgumentParser(description="End2End User Journey Load Tester")
-    parser.add_argument("--portal-url", default="http://splunk-arcade.home:80",
-                       help="Portal URL (default: http://splunk-arcade.home:80)")
+    parser.add_argument("--portal-url", default=None,
+                       help="Portal URL (default: auto-detected based on --production flag)")
     parser.add_argument("--users", type=int, default=5,
                        help="Number of concurrent users (default: 5)")
     parser.add_argument("--duration", type=int, default=180,
                        help="User journey duration per user in seconds (default: 180)")
+    parser.add_argument("--production", action="store_true",
+                       help="Use production HTTPS URL and ignore SSL validation (default: local HTTP)")
+    parser.add_argument("--burst", action="store_true",
+                       help="All users start immediately (no staggered starts for burst testing)")
+    parser.add_argument("--reg-batch-size", type=int, default=15,
+                       help="Registration batch size for parallel processing (default: 15)")
+    parser.add_argument("--login-batch-size", type=int, default=20,
+                       help="Login batch size for parallel processing (default: 20)")
     
     args = parser.parse_args()
     
-    tester = End2EndUserTester(args.portal_url)
-    await tester.run_e2e_test(args.users, args.duration)
+    # Set default portal URL based on production flag
+    if args.portal_url is None:
+        if args.production:
+            portal_url = "https://us.splunkarcade.com"
+        else:
+            portal_url = "http://splunk-arcade.home:80"
+    else:
+        portal_url = args.portal_url
+    
+    tester = End2EndUserTester(portal_url, production=args.production)
+    await tester.run_e2e_test(
+        num_users=args.users, 
+        duration=args.duration,
+        burst_mode=args.burst,
+        reg_batch_size=args.reg_batch_size,
+        login_batch_size=args.login_batch_size
+    )
 
 
 if __name__ == "__main__":
