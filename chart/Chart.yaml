@@ -14,7 +14,7 @@ dependencies:
     version: 0.113.0
   - name: redis
     repository: oci://registry-1.docker.io/bitnamicharts
-    version: 20.5.0
+    version: 23.2.2
   - name: postgresql
     repository: oci://registry-1.docker.io/bitnamicharts
-    version: 16.2.5
+    version: 18.1.3
